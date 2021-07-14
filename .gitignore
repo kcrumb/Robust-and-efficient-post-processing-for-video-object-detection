@@ -134,3 +134,4 @@ nohup.out
 *.pckl
 *.txt
 *.json
+.idea/

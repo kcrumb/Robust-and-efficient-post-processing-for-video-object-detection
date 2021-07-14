@@ -6,6 +6,6 @@
 	"clf_mode": "dot",
 	"recoordinate": true,
 	"recoordinate_std": 0.6,
-	"min_pred_score":  5e-3,
-	"appearance_matching": true
+	"min_pred_score":  0.2,
+	"appearance_matching": false
 }

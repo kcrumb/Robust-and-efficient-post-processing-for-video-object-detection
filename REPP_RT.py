@@ -6,13 +6,14 @@ Created on Fri Aug 14 11:46:22 2020
 @author: asabater
 """
 
+import copy
 import json
 import pickle
 
 import numpy as np
 from scipy import signal, ndimage
 
-from repp_utils import get_video_frame_iterator, get_iou, get_pair_features
+from repp_utils import get_iou, get_pair_features
 
 INF = 9e15
 
@@ -26,7 +27,7 @@ class REPP():
 
     def __init__(self, min_tubelet_score, add_unmatched, min_pred_score,
                  distance_func, clf_thr, clf_mode, appearance_matching,
-                 recoordinate, recoordinate_std,
+                 recoordinate, recoordinate_std, window_size,
                  store_coco=False, store_imdb=False,
                  annotations_filename='',
                  **kwargs):
@@ -44,6 +45,10 @@ class REPP():
         self.recoordinate_std = recoordinate_std  # Strength of the recoordinating step
         self.store_coco = store_coco  # True to store predictions with the COCO format
         self.store_imdb = store_imdb  # True to store predictions with the IMDB format. Needed for evaluation
+
+        self.pairs = []
+        self.unmatched_pairs = []
+        self.window_size = window_size
 
         if self.distance_func == 'def':
             self.match_func = self.distance_def
@@ -85,7 +90,7 @@ class REPP():
         elif self.clf_mode == 'dot_plus':
             score = np.dot(p1['scores'], p2['scores']) + score
         elif self.clf_mode == 'def':
-            return distance_def(p1, p2)
+            return self.distance_def(p1, p2)
         elif self.clf_mode == 'raw':
             pass
         else:
@@ -122,6 +127,36 @@ class REPP():
             unmatched_pairs.append(unmatched_pairs_i)
 
         return pairs, unmatched_pairs
+
+    # Return a list of pairs of frames linked across frames
+    def get_video_pairs_rt(self, preds_frame, first_time: bool = False):
+
+        if first_time:
+            self.pairs, self.unmatched_pairs = self.get_video_pairs(preds_frame)
+        else:
+            self.pairs.pop(0)
+            self.unmatched_pairs.pop(0)
+
+            frames = list(preds_frame.keys())
+            frames = sorted(frames, key=int)
+            pairs_i = []
+            frame_1, frame_2 = frames[-2], frames[-1]
+            preds_frame_1, preds_frame_2 = preds_frame[frame_1], preds_frame[frame_2]
+            num_preds_1, num_preds_2 = len(preds_frame_1), len(preds_frame_2)
+            if num_preds_1 != 0 and num_preds_2 != 0:
+                # Get distance matrix
+                distances = np.zeros((num_preds_1, num_preds_2))
+                for i, p1 in enumerate(preds_frame_1):
+                    for j, p2 in enumerate(preds_frame_2):
+                        distances[i, j] = self.match_func(p1, p2)
+                pairs_i = self.solve_distances_def(distances, maximization_problem=False)
+
+            unmatched_pairs_i = [i for i in range(num_preds_1) if i not in [p[0] for p in pairs_i]]
+
+            self.pairs.append(pairs_i)
+            self.unmatched_pairs.append(unmatched_pairs_i)
+
+        return copy.deepcopy(self.pairs), copy.deepcopy(self.unmatched_pairs)
 
     # Solve distance matrix and return a list of pair of linked detections from two consecutive frames
     def solve_distances_def(self, distances, maximization_problem):
@@ -170,7 +205,7 @@ class REPP():
 
                         # Continue tubelet
                     else:
-                        pair = pair[0];
+                        pair = pair[0]
                         del pairs[current_frame][pairs[current_frame].index(pair)]
                         tubelets[tubelets_count].append((current_frame, preds_frame[frames[current_frame]][ind]))
                         ind = pair[1]
@@ -255,7 +290,7 @@ class REPP():
             track_id_num += 1
         return preds
 
-    def __call__(self, video_predictions):
+    def __call__(self, video_predictions, ft: bool = False):
         # Filter out low-score predictions
         for frame in video_predictions.keys():
             video_predictions[frame] = [p for p in video_predictions[frame] if
@@ -263,10 +298,20 @@ class REPP():
 
         video_predictions = dict(sorted(video_predictions.items()))
 
-        pairs, unmatched_pairs = self.get_video_pairs(video_predictions)
-        tubelets = self.get_tubelets(video_predictions, pairs)
+        # import time
 
+        # start_time = time.time()
+        # pairs, unmatched_pairs = self.get_video_pairs(video_predictions)
+        pairs, unmatched_pairs = self.get_video_pairs_rt(video_predictions, first_time=ft)
+        # print("========== get_video_pairs:\t\t%.6f sec ==========" % (time.time() - start_time))
+
+        # start_time = time.time()
+        tubelets = self.get_tubelets(video_predictions, pairs)
+        # print("========== get_tubelets:\t\t%.6f sec ==========" % (time.time() - start_time))
+
+        # start_time = time.time()
         tubelets = self.rescore_tubelets(tubelets)
+        # print("========== rescore_tubelets:\t%.6f sec ==========\n" % (time.time() - start_time))
 
         if self.recoordinate: tubelets = self.recoordinate_tubelets_full(tubelets)
 
@@ -286,14 +331,52 @@ class REPP():
         return predictions_coco, predictions_imdb
 
 
+def get_vid_preds(path: str):
+    from PIL import Image
+    from pathlib import Path
+
+    folder = Path(path)
+    images = [x for x in folder.iterdir() if x.name.endswith('.png')]
+    images.sort(key=lambda x: int(x.name[:x.name.index(x.suffix)]))
+    bb_files = [x for x in folder.iterdir() if x.name.endswith('.txt')]
+    bb_files.sort(key=lambda x: int(x.name[:x.name.index(x.suffix)]))
+
+    preds = {}
+    for idx, img in enumerate(images):
+        im = Image.open(img)
+        annotation_file = bb_files[idx]
+        # get frame number
+        num = annotation_file.name
+        num = num[:num.index(annotation_file.suffix)]
+        # read boxes
+        with annotation_file.open() as f:
+            lines = [l.split(' ') for l in f.read().splitlines()]
+        # convert boxes to COCO format
+        boxes = []
+        for l in lines:
+            box_width = float(l[3]) * im.width
+            box_height = float(l[4]) * im.height
+            x = (float(l[1]) * im.width) - (box_width / 2)
+            y = (float(l[2]) * im.height) - (box_height / 2)
+            # create box entry
+            entry = {'image_id': num, 'bbox': [x, y, box_width, box_height],
+                     'bbox_center': [float(l[1]), float(l[2])], 'scores': [float(l[5])]}
+            # add to list of frame boxes
+            boxes.append(entry)
+        # add to list of frames predictions
+        preds[int(num)] = boxes
+    return preds
+
+
 if __name__ == '__main__':
 
     import argparse
+    from pathlib import Path
 
     parser = argparse.ArgumentParser(description='Apply REPP to a saved predictions file')
     parser.add_argument('--repp_cfg', help='repp cfg filename', type=str)
     parser.add_argument('--predictions_file', help='predictions filename', type=str)
-    parser.add_argument('--from_python_2', help='predictions filename', action='store_true')
+    # parser.add_argument('--from_python_2', help='predictions filename', action='store_true')
     parser.add_argument('--evaluate', help='evaluate motion mAP', action='store_true')
     parser.add_argument('--annotations_filename', help='ILSVRC annotations. Needed for ILSVRC evaluation',
                         required=False, type=str)
@@ -301,18 +384,22 @@ if __name__ == '__main__':
                         required=False, type=str)
     parser.add_argument('--store_coco', help='store processed predictions in coco format', action='store_true')
     parser.add_argument('--store_imdb', help='store processed predictions in imdb format', action='store_true')
+    parser.add_argument('--store', help='folder path to store processed predications into individual files', type=Path)
+    parser.add_argument('--window_size', help='size of buffer', type=int)
+    parser.add_argument('--vid_path', help='path to folder with video frames', type=str)
     args = parser.parse_args()
 
-    assert not (
-            args.evaluate and args.annotations_filename is None), 'Annotations filename is required for ILSVRC evaluation'
-    assert not (args.evaluate and args.path_dataset is None), 'Dataset path is required for ILSVRC evaluation'
+    assert not (args.evaluate and args.annotations_filename is None), \
+        'Annotations filename is required for ILSVRC evaluation'
+    assert not (args.evaluate and args.path_dataset is None), \
+        'Dataset path is required for ILSVRC evaluation'
 
     print(' * Loading REPP cfg')
     repp_params = json.load(open(args.repp_cfg, 'r'))
     print(repp_params)
     predictions_file_out = args.predictions_file.replace('.pckl', '_repp')
 
-    repp = REPP(**repp_params, annotations_filename=args.annotations_filename,
+    repp = REPP(**repp_params, window_size=args.window_size, annotations_filename=args.annotations_filename,
                 store_coco=args.store_coco, store_imdb=args.store_imdb or args.evaluate)
 
     from tqdm import tqdm
@@ -323,40 +410,118 @@ if __name__ == '__main__':
     if args.evaluate:
         with open(args.annotations_filename, 'r') as f: annotations = sorted(f.read().splitlines())
         pbar = tqdm(total=len(annotations), file=sys.stdout)
-    for vid, video_preds in get_video_frame_iterator(args.predictions_file, from_python_2=args.from_python_2):
-        predictions_coco, predictions_imdb = repp(video_preds)
-        total_preds_coco += predictions_coco
-        total_preds_imdb += predictions_imdb
-        if args.evaluate: pbar.update(len(video_preds))
 
-    if args.store_imdb:
-        print(' * Dumping predictions with the IMDB format:', predictions_file_out + '_imdb.txt')
-        with open(predictions_file_out + '_imdb.txt', 'w') as f:
-            for p in total_preds_imdb: f.write(p + '\n')
+    # simulate real-time video feed
+    from PIL import Image
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
 
-    if args.store_coco:
-        print(' * Dumping predictions with the COCO format:', predictions_file_out + '_coco.json')
-        json.dump(total_preds_coco, open(predictions_file_out + '_coco.json', 'w'))
+    # trigger: pred=detection(frame)
 
-    if args.evaluate:
+    vid_preds = get_vid_preds(args.vid_path)
+    folder = Path(args.vid_path)
+    images = [x for x in folder.iterdir() if x.name.endswith('.png')]
+    images.sort(key=lambda x: int(x.name[:x.name.index(x.suffix)]))
 
-        print(' * Evaluating REPP predictions')
+    window_preds = {}
+    window_numbers = []
 
-        import sys
+    fig, ax = plt.subplots()
+    plt.show(block=False)
 
-        sys.path.append('ObjectDetection_mAP_by_motion')
-        from ObjectDetection_mAP_by_motion import motion_utils
-        from ObjectDetection_mAP_by_motion.imagenet_vid_eval_motion import get_motion_mAP
-        import os
+    first_time = True
+    total_preds = {}
 
-        stats_file_motion = predictions_file_out.replace('preds', 'stats').replace('.txt', '.json')
-        motion_iou_file_orig = './ObjectDetection_mAP_by_motion/imagenet_vid_groundtruth_motion_iou.mat'
-        imageset_filename_orig = os.path.join(args.path_dataset, 'ImageSets/VID/val.txt')
+    for img in images:
+        # delete oldest predication if window is full
+        if len(window_preds) == repp.window_size:
+            num = window_numbers.pop(0)
+            del window_preds[num]
+        # add predication to window buffer
+        frame_number = int(img.name[:img.name.index(img.suffix)])
+        window_numbers.append(frame_number)
+        window_preds[frame_number] = vid_preds[frame_number]
 
-        if os.path.isfile(stats_file_motion): os.remove(stats_file_motion)
-        stats = get_motion_mAP(args.annotations_filename, args.path_dataset,
-                               predictions_file_out + '_imdb.txt', stats_file_motion,
-                               motion_iou_file_orig, imageset_filename_orig)
+        # show frame
+        ax.imshow(Image.open(img))
+        ax.set_title(img.name)
 
-        print(stats)
-        print(' * Stats stored:', stats_file_motion)
+        # display detected boxes (window_preds will be modified in REPP)
+        for pred_box in window_preds[frame_number]:
+            # only show boxes that exceeds min_tubelet_score
+            if max(pred_box['scores']) >= repp_params['min_tubelet_score']:
+                post_box = patches.Rectangle((pred_box['bbox'][0], pred_box['bbox'][1]),
+                                             pred_box['bbox'][2], pred_box['bbox'][3],
+                                             linewidth=1, edgecolor='r', facecolor='none')
+                ax.add_patch(post_box)
+
+        latest_pred = None
+        if len(window_preds) == repp.window_size:
+            predictions_coco, predictions_imdb = repp(window_preds, first_time)
+            first_time = False
+            total_preds_coco += predictions_coco
+            total_preds_imdb += predictions_imdb
+
+            # get predictions of frame
+            latest_pred = [e for e in predictions_coco if e['image_id'] == str(frame_number)]
+            # latest_pred = predictions_coco[-1] if len(predictions_coco) > 0 else None
+
+        # TODO: Liefert predictions_coco immer nur eine Box pro frame?
+        # display boxes of post-processing
+        if latest_pred is not None and len(latest_pred) > 0:
+            for lp in latest_pred:
+                post_box = patches.Rectangle((lp['bbox'][0], lp['bbox'][1]), lp['bbox'][2], lp['bbox'][3],
+                                             linewidth=1, edgecolor='g', facecolor='none')
+                ax.add_patch(post_box)
+
+            if args.store:
+                lines = []
+                for lp in latest_pred:
+                    lines.append('{class_name} {conf} {left} {top} {right} {bottom}'.format(
+                    class_name='polyp', conf=lp['score'],left=lp['bbox'][0], top=lp['bbox'][1],
+                    right=lp['bbox'][0] + lp['bbox'][2], bottom=lp['bbox'][1] + lp['bbox'][3]))
+                    total_preds[frame_number] = lines
+
+        # pause an reload next frame
+        plt.pause(0.1)
+        ax.clear()
+        fig.canvas.draw()
+
+    if args.store:
+        print(' * Dumping predictions as individual files:', args.store)
+        args.store.mkdir()
+        for img_id in total_preds.keys():
+            with open(args.store.joinpath('{}.txt'.format(img_id)), mode='w') as f:
+                f.write('\n'.join(total_preds[img_id]))
+
+    # if args.store_imdb:
+    #     print(' * Dumping predictions with the IMDB format:', predictions_file_out + '_imdb.txt')
+    #     with open(predictions_file_out + '_imdb.txt', 'w') as f:
+    #         for p in total_preds_imdb: f.write(p + '\n')
+    #
+    # if args.store_coco:
+    #     print(' * Dumping predictions with the COCO format:', predictions_file_out + '_coco.json')
+    #     json.dump(total_preds_coco, open(predictions_file_out + '_coco.json', 'w'))
+
+    # if args.evaluate:
+    #
+    #     print(' * Evaluating REPP predictions')
+    #
+    #     import sys
+    #
+    #     sys.path.append('ObjectDetection_mAP_by_motion')
+    #     from ObjectDetection_mAP_by_motion import motion_utils
+    #     from ObjectDetection_mAP_by_motion.imagenet_vid_eval_motion import get_motion_mAP
+    #     import os
+    #
+    #     stats_file_motion = predictions_file_out.replace('preds', 'stats').replace('.txt', '.json')
+    #     motion_iou_file_orig = './ObjectDetection_mAP_by_motion/imagenet_vid_groundtruth_motion_iou.mat'
+    #     imageset_filename_orig = os.path.join(args.path_dataset, 'ImageSets/VID/val.txt')
+    #
+    #     if os.path.isfile(stats_file_motion): os.remove(stats_file_motion)
+    #     stats = get_motion_mAP(args.annotations_filename, args.path_dataset,
+    #                            predictions_file_out + '_imdb.txt', stats_file_motion,
+    #                            motion_iou_file_orig, imageset_filename_orig)
+    #
+    #     print(stats)
+    #     print(' * Stats stored:', stats_file_motion)
