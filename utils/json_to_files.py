@@ -1,9 +1,12 @@
 import json
 
 # num = 1
-for num in range(1, 19):
-    path = 'D:/Development/REPP/data_repp/repp_{}/'.format(num)
-    with open('D:/Development/REPP/data_repp/repp_{}.pkl_coco.json'.format(num), mode='r') as f:
+# for num in range(1, 19):
+for num in ['ci_3(1)']:
+    # path = 'D:/Development/REPP/data_repp/repp_{}/'.format(num)
+    path = 'D:/Development/REPP/validation_repp/uniklinikum-endo_{}/'.format(num)
+    # with open('D:/Development/REPP/data_repp/repp_{}.pkl_coco.json'.format(num), mode='r') as f:
+    with open('D:/Development/REPP/validation_videos_split/repp_uniklinikum-endo_{}.pkl_coco.json'.format(num), mode='r') as f:
         repp_org = json.load(f)
     print('Converting REPP JSON to individual files:', path)
     preds = {}
