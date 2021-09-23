@@ -422,7 +422,7 @@ if __name__ == '__main__':
 
     folder = Path(args.frames)
     # images = [x for x in folder.iterdir()]
-    images = [x for x in folder.iterdir() if x.name.endswith('.jpg')]
+    images = [x for x in folder.iterdir()]
     images.sort(key=lambda x: int(x.name[:x.name.index(x.suffix)]))
 
     window_preds = {}
